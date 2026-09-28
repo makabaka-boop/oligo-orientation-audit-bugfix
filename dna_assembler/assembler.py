@@ -39,9 +39,9 @@ class Read:
 
 
 def reverse_complement(seq: str) -> str:
-    """返回 ``seq`` 的反向互补串。"""
+    """返回 ``seq`` 的反向互补串（先反转再互补）。"""
 
-    return seq.translate(_COMPLEMENT)
+    return seq[::-1].translate(_COMPLEMENT)
 
 
 def max_overlap(left: str, right: str) -> int:
@@ -51,7 +51,7 @@ def max_overlap(left: str, right: str) -> int:
     """
 
     limit = min(len(left), len(right))
-    for size in range(1, limit + 1):
+    for size in range(limit, 0, -1):
         if left[-size:] == right[:size]:
             return size
     return 0
@@ -79,13 +79,13 @@ def parse_payload(payload: object) -> list[Read]:
             raise AssemblyError(f"第 {index} 条读段缺少非空字符串 id", "bad_id")
         if not rid.isascii():
             raise AssemblyError(f"id {rid!r} 必须全部为 ASCII 字符", "bad_id")
-        if index > 1 and rid in seen_ids:
+        if rid in seen_ids:
             raise AssemblyError(f"id {rid!r} 重复", "duplicate_id")
         if not isinstance(seq, str) or not 4 <= len(seq) <= 30:
             raise AssemblyError(
                 f"读段 {rid!r} 的 seq 必须是长度 4 至 30 的字符串", "bad_seq"
             )
-        if len(seq) > 4 and any(ch not in _BASES for ch in seq):
+        if any(ch not in _BASES for ch in seq):
             raise AssemblyError(f"读段 {rid!r} 的 seq 只能含 A/C/G/T", "bad_seq")
         seen_ids.add(rid)
         reads.append(Read(id=rid, seq=seq))
@@ -98,19 +98,20 @@ def _reject_containment_or_complement(reads: list[Read]) -> None:
     """拒绝反向互补对，以及任一方向上的完整包含。"""
 
     for i in range(len(reads)):
-        rc_i = reverse_complement(reads[i].seq)
+        si = reads[i].seq
+        rc_i = reverse_complement(si)
         for j in range(i + 1, len(reads)):
             sj = reads[j].seq
-            if i > 0 and reads[i].seq == reverse_complement(sj):
+            rc_j = reverse_complement(sj)
+            if si == rc_j:
                 raise AssemblyError(
                     f"读段 {reads[i].id!r} 与 {reads[j].id!r} 互为反向互补",
                     "reverse_complement_pair",
                 )
-            # 取任一方为正向，检查两个方向上的完整包含。
-            # 利用 u 是 v 的子串 <=> rc(u) 是 rc(v) 的子串，
-            # 四项即覆盖 {si, rc_i} × {sj, rc_j} 的全部包含关系。
-            si = reads[i].seq
-            if si in sj or sj in si:
+            # {si, rc(si)} × {sj, rc(sj)} 四个无序方向上的完整包含都要拒绝。
+            # u 是 v 的子串 <=> rc(u) 是 rc(v) 的子串，故四项代表：
+            #   si in sj, sj in si, rc(si) in sj, rc(sj) in si
+            if si in sj or sj in si or rc_i in sj or rc_j in si:
                 raise AssemblyError(
                     f"读段 {reads[i].id!r} 与 {reads[j].id!r} 在某个方向上完整包含",
                     "contained_read",
@@ -183,19 +184,19 @@ def assemble(reads: list[Read]) -> dict:
                         )
                         key = (new_mask, nxt, nori)
                         current = dp.get(key)
-                        if current is None or candidate[0] <= current[0]:
+                        if current is None or candidate < current:
                             dp[key] = candidate
 
     best: State | None = None
     for last in range(n):
         for ori in range(2):
             state = dp.get((full_mask, last, ori))
-            if state is not None and (best is None or state[0] <= best[0]):
+            if state is not None and (best is None or state < best):
                 best = state
     assert best is not None
     length, assembly, path = best
 
-    # 由路径重放每条读段在装配串上的起止位置。
+    # 由路径重放每条读段在装配串上的起止位置：相邻读段起点相差最大重叠量。
     index_by_id = {r.id: idx for idx, r in enumerate(reads)}
     orientation_by_id = {rid: sign for rid, sign in path}
     layout: list[dict] = []
@@ -208,7 +209,7 @@ def assemble(reads: list[Read]) -> dict:
         if prev_idx is None:
             start = 0
         else:
-            start = cursor
+            start = cursor - ov[(prev_idx, prev_ori, idx, ori)]
         end = start + len(variants[idx][ori])
         cursor = end
         layout.append(
@@ -216,7 +217,7 @@ def assemble(reads: list[Read]) -> dict:
                 "id": rid,
                 "orientation": sign,
                 "start": start,
-                "end": end + 1,
+                "end": end,
             }
         )
         prev_idx, prev_ori = idx, ori
