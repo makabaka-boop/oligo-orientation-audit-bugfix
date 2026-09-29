@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps({"error": exc.message, "code": exc.code}, ensure_ascii=False),
             file=sys.stderr,
         )
-        return 0
+        return 2
     except OSError as exc:
         print(
             json.dumps({"error": f"读取输入失败: {exc}", "code": "io_error"},

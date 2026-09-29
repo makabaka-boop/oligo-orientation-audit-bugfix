@@ -41,7 +41,7 @@ class Read:
 def reverse_complement(seq: str) -> str:
     """返回 ``seq`` 的反向互补串。"""
 
-    return seq.translate(_COMPLEMENT)
+    return seq.translate(_COMPLEMENT)[::-1]
 
 
 def max_overlap(left: str, right: str) -> int:
@@ -51,7 +51,7 @@ def max_overlap(left: str, right: str) -> int:
     """
 
     limit = min(len(left), len(right))
-    for size in range(1, limit + 1):
+    for size in range(limit, 0, -1):
         if left[-size:] == right[:size]:
             return size
     return 0
@@ -77,15 +77,15 @@ def parse_payload(payload: object) -> list[Read]:
         seq = item.get("seq")
         if not isinstance(rid, str) or not rid:
             raise AssemblyError(f"第 {index} 条读段缺少非空字符串 id", "bad_id")
-        if not rid.isascii():
-            raise AssemblyError(f"id {rid!r} 必须全部为 ASCII 字符", "bad_id")
-        if index > 1 and rid in seen_ids:
+        if not rid.isascii() or not all(" " <= ch <= "~" for ch in rid):
+            raise AssemblyError(f"id {rid!r} 必须全部为可打印 ASCII 字符", "bad_id")
+        if rid in seen_ids:
             raise AssemblyError(f"id {rid!r} 重复", "duplicate_id")
         if not isinstance(seq, str) or not 4 <= len(seq) <= 30:
             raise AssemblyError(
                 f"读段 {rid!r} 的 seq 必须是长度 4 至 30 的字符串", "bad_seq"
             )
-        if len(seq) > 4 and any(ch not in _BASES for ch in seq):
+        if any(ch not in _BASES for ch in seq):
             raise AssemblyError(f"读段 {rid!r} 的 seq 只能含 A/C/G/T", "bad_seq")
         seen_ids.add(rid)
         reads.append(Read(id=rid, seq=seq))
@@ -97,23 +97,36 @@ def parse_payload(payload: object) -> list[Read]:
 def _reject_containment_or_complement(reads: list[Read]) -> None:
     """拒绝反向互补对，以及任一方向上的完整包含。"""
 
+    seqs = [r.seq for r in reads]
+    rc_seqs = [reverse_complement(s) for s in seqs]
     for i in range(len(reads)):
-        rc_i = reverse_complement(reads[i].seq)
         for j in range(i + 1, len(reads)):
-            sj = reads[j].seq
-            if i > 0 and reads[i].seq == reverse_complement(sj):
-                raise AssemblyError(
-                    f"读段 {reads[i].id!r} 与 {reads[j].id!r} 互为反向互补",
-                    "reverse_complement_pair",
-                )
-            # 取任一方为正向，检查两个方向上的完整包含。
-            # 利用 u 是 v 的子串 <=> rc(u) 是 rc(v) 的子串，
-            # 四项即覆盖 {si, rc_i} × {sj, rc_j} 的全部包含关系。
-            si = reads[i].seq
-            if si in sj or sj in si:
+            si, sj = seqs[i], seqs[j]
+            rc_i, rc_j = rc_seqs[i], rc_seqs[j]
+            # 先检查 {si, rc_i} × {sj, rc_j} 四个方向上的严格完整包含
+            # （等长相同不算包含：两条不同序列等长时不可能互为子串，
+            # 只有完全相同才会命中，将作为重复读段在此拒绝）。利用
+            # u 是 v 的子串 <=> rc(u) 是 rc(v) 的子串，六项即可覆盖
+            # 全部方向；等长情形（互为反向互补）不在此拒绝，留给下方分类。
+            if (
+                (len(si) < len(sj) and si in sj)
+                or (len(sj) < len(si) and sj in si)
+                or (len(rc_i) < len(sj) and rc_i in sj)
+                or (len(sj) < len(rc_i) and sj in rc_i)
+                or (len(si) < len(rc_j) and si in rc_j)
+                or (len(rc_j) < len(si) and rc_j in si)
+                or si == sj
+            ):
                 raise AssemblyError(
                     f"读段 {reads[i].id!r} 与 {reads[j].id!r} 在某个方向上完整包含",
                     "contained_read",
+                )
+            # 再判反向互补对（si == rc_j 等价于 rc_i == sj）；
+            # 完全相同的 RC 回文（si == sj == rc_j）已在上方按包含拒绝。
+            if si == rc_j:
+                raise AssemblyError(
+                    f"读段 {reads[i].id!r} 与 {reads[j].id!r} 互为反向互补",
+                    "reverse_complement_pair",
                 )
 
 
@@ -183,19 +196,20 @@ def assemble(reads: list[Read]) -> dict:
                         )
                         key = (new_mask, nxt, nori)
                         current = dp.get(key)
-                        if current is None or candidate[0] <= current[0]:
+                        if current is None or candidate < current:
                             dp[key] = candidate
 
     best: State | None = None
     for last in range(n):
         for ori in range(2):
             state = dp.get((full_mask, last, ori))
-            if state is not None and (best is None or state[0] <= best[0]):
+            if state is not None and (best is None or state < best):
                 best = state
     assert best is not None
     length, assembly, path = best
 
-    # 由路径重放每条读段在装配串上的起止位置。
+    # 由路径重放每条读段在装配串上的起止位置：相邻读段按最大精确重叠
+    # 回退，保证 assembly[start:end] 恰为该读段所选方向上的序列。
     index_by_id = {r.id: idx for idx, r in enumerate(reads)}
     orientation_by_id = {rid: sign for rid, sign in path}
     layout: list[dict] = []
@@ -208,7 +222,7 @@ def assemble(reads: list[Read]) -> dict:
         if prev_idx is None:
             start = 0
         else:
-            start = cursor
+            start = cursor - ov[(prev_idx, prev_ori, idx, ori)]
         end = start + len(variants[idx][ori])
         cursor = end
         layout.append(
@@ -216,7 +230,7 @@ def assemble(reads: list[Read]) -> dict:
                 "id": rid,
                 "orientation": sign,
                 "start": start,
-                "end": end + 1,
+                "end": end,
             }
         )
         prev_idx, prev_ori = idx, ori
